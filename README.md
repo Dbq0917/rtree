@@ -115,22 +115,15 @@ Same as the original algorithm.
 
 ### Splitting
 
-This is a custom algorithm. It attempts to minimize intensive operations such as pre-sorting the children and comparing overlaps & area sizes. The desire is to do simple single axis distance calculations each child only once, with a target 50/50 chance that the child might be moved in-memory.
+Splits are distribution-based and local to the overflowing node. The node's
+child centers are measured on both axes, and the axis with the greater spread
+is selected. The node's entries are then sorted by their center on that axis
+and split at the median, with half of the entries remaining in the original
+node and half moving to the new sibling.
 
-When a rect has reached it's max number of entries it's largest axis is calculated and the rect is split into two smaller rects, named `left` and `right`.
-Each child rects is then evaluated to determine which smaller rect it should be placed into.
-Two values, `min-dist` and `max-dist`, are calcuated for each child. 
-
-- `min-dist` is the distance from the parent's minumum value of it's largest axis to the child's minumum value of the parent largest axis.
-- `max-dist` is the distance from the parent's maximum value of it's largest axis to the child's maximum value of the parent largest axis.
-
-When the `min-dist` is less than `max-dist` then the child is placed into the `left` rect. 
-When the `max-dist` is less than `min-dist` then the child is placed into the `right` rect. 
-When the `min-dist` is equal to `max-dist` then the child is placed into an `equal` bucket until all of the children are evaluated.
-Each `equal` rect is then one-by-one placed in either `left` or `right`, whichever has less children.
-
-Finally, sort all the rects in the parent node of the split rect by their
-minimum x value.
+Only the entries of the node being split are reordered. No other node is
+rebuilt or sorted, so insertion remains an in-place tree update while split
+occupancy stays balanced regardless of insertion order.
 
 ## License
 

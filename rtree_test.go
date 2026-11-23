@@ -311,6 +311,98 @@ func TestRTreeBenchFloat32(t *testing.T) {
 
 }
 
+func TestSplitByDistribution(t *testing.T) {
+	var tr RTreeG[int]
+	left := tr.base.newNode(true)
+	left.count = maxEntries
+	for i := 0; i < maxEntries; i++ {
+		pt := [2]float64{1000 + float64(i), 10}
+		left.rects[i] = rect[float64]{pt, pt}
+		left.items()[i] = i
+	}
+
+	// The old edge-snap split used this wide parent rectangle and would move
+	// nearly every entry to one side. Splitting must follow the node contents.
+	r := rect[float64]{
+		min: [2]float64{0, 0},
+		max: [2]float64{2000, 20},
+	}
+	right := tr.base.splitNode(r, left)
+	if left.count != maxEntries/2 || right.count != maxEntries/2 {
+		t.Fatalf("unbalanced split: left=%d right=%d", left.count, right.count)
+	}
+	seen := make(map[int]bool, maxEntries)
+	for i := 0; i < int(left.count); i++ {
+		seen[left.items()[i]] = true
+	}
+	for i := 0; i < int(right.count); i++ {
+		seen[right.items()[i]] = true
+	}
+	if len(seen) != maxEntries {
+		t.Fatalf("split lost or duplicated items: got %d of %d",
+			len(seen), maxEntries)
+	}
+}
+
+func nodeHeight[N numeric, T any](n *node[N, T]) int {
+	if n == nil {
+		return 0
+	}
+	if n.leaf() {
+		return 1
+	}
+	var height int
+	for i := 0; i < int(n.count); i++ {
+		if h := nodeHeight(n.children()[i]); h > height {
+			height = h
+		}
+	}
+	return height + 1
+}
+
+func TestBulkInsertMillionPoints(t *testing.T) {
+	const N = 1_000_000
+	const minX, maxX = -180.0, 180.0
+	const minY, maxY = -90.0, 90.0
+
+	rng := rand.New(rand.NewSource(1))
+	pts := make([][2]float64, N)
+	var tr RTreeG[int]
+	for i := 0; i < N; i++ {
+		pts[i] = [2]float64{
+			minX + (maxX-minX)*float64(i)/(N-1),
+			minY + (maxY-minY)*rng.Float64(),
+		}
+		tr.Insert(pts[i], pts[i], i)
+	}
+
+	height := nodeHeight(tr.base.root)
+	t.Logf("million-point tree height: %d", height)
+	if height > 8 {
+		t.Fatalf("tree is not balanced: height=%d", height)
+	}
+	if tr.Len() != N {
+		t.Fatalf("expected %d items, got %d", N, tr.Len())
+	}
+
+	for k := 0; k < 1000; k++ {
+		i := int(rng.Int63n(N))
+		found := false
+		tr.Search(pts[i], pts[i],
+			func(min, max [2]float64, data int) bool {
+				if data == i {
+					found = true
+					return false
+				}
+				return true
+			},
+		)
+		if !found {
+			t.Fatalf("point %d not found", i)
+		}
+	}
+}
+
 func TestClear(t *testing.T) {
 	var tr RTree
 	for i := 0; i < 1_000; i++ {
