@@ -389,6 +389,32 @@ func (n *node[N, T]) search(target *rect[N],
 	return true
 }
 
+func (n *node[N, T]) searchClosed(target *rect[N],
+	iter func(min, max [2]N, data T) bool,
+) bool {
+	rects := n.rects[:n.count]
+	if n.leaf() {
+		items := n.items()
+		for i := 0; i < len(rects); i++ {
+			if target.contains(&rects[i]) {
+				if !iter(rects[i].min, rects[i].max, items[i]) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	children := n.children()
+	for i := 0; i < len(rects); i++ {
+		if target.intersects(&rects[i]) {
+			if !children[i].searchClosed(target, iter) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // Len returns the number of items in tree
 func (tr *RTreeGN[N, T]) Len() int {
 	return tr.count
@@ -404,6 +430,24 @@ func (tr *RTreeGN[N, T]) Search(min, max [2]N,
 	}
 	if target.intersects(&tr.rect) {
 		tr.root.search(&target, iter)
+	}
+}
+
+// SearchClosed searches for items that are fully contained in the closed
+// rectangle [min, max]. An item is returned when
+// min[d] <= item.min[d] and item.max[d] <= max[d] for both axes, so items
+// lying exactly on the boundary are included, while items that are outside
+// or only touch or cross the boundary from the outside are not.
+// The result set does not depend on the shape of the tree.
+func (tr *RTreeGN[N, T]) SearchClosed(min, max [2]N,
+	iter func(min, max [2]N, data T) bool,
+) {
+	target := rect[N]{min, max}
+	if tr.root == nil {
+		return
+	}
+	if target.intersects(&tr.rect) {
+		tr.root.searchClosed(&target, iter)
 	}
 }
 
@@ -869,6 +913,14 @@ func (tr *RTreeG[T]) Search(min, max [2]float64,
 	tr.base.Search(min, max, iter)
 }
 
+// SearchClosed searches for items that are fully contained in the closed
+// rectangle [min, max]. Items lying exactly on the boundary are included.
+func (tr *RTreeG[T]) SearchClosed(min, max [2]float64,
+	iter func(min, max [2]float64, data T) bool,
+) {
+	tr.base.SearchClosed(min, max, iter)
+}
+
 // Scan all items in the tree
 func (tr *RTreeG[T]) Scan(iter func(min, max [2]float64, data T) bool) {
 	tr.base.Scan(iter)
@@ -1020,6 +1072,16 @@ func (tr *RTree) Search(
 	iter func(min, max [2]float64, data any) bool,
 ) {
 	tr.base.Search(min, max, iter)
+}
+
+// SearchClosed searches the structure for items that are fully contained
+// in the closed rect param. Items lying exactly on the boundary are
+// included.
+func (tr *RTree) SearchClosed(
+	min, max [2]float64,
+	iter func(min, max [2]float64, data any) bool,
+) {
+	tr.base.SearchClosed(min, max, iter)
 }
 
 // Scan iterates through all data in tree in no specified order.

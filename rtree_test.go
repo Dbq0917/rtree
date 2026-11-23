@@ -954,3 +954,166 @@ func TestNearby(t *testing.T) {
 	})
 
 }
+
+func TestSearchClosed(t *testing.T) {
+	qmin := [2]float64{10, 10}
+	qmax := [2]float64{20, 20}
+	// inside: 4 corners + 4 edge midpoints + 1 center, all on the closed
+	// boundary or interior of the query rect.
+	inside := [][2]float64{
+		{10, 10}, {10, 20}, {20, 10}, {20, 20},
+		{15, 10}, {15, 20}, {10, 15}, {20, 15},
+		{15, 15},
+	}
+	// outside: points from the adjacent grid cells, one step past each
+	// edge and corner.
+	outside := [][2]float64{
+		{9, 15}, {21, 15}, {15, 9}, {15, 21},
+		{9, 9}, {9, 21}, {21, 9}, {21, 21},
+	}
+	// background points to force node splits; all strictly outside the
+	// query rect so they must never be returned.
+	var background [][2]float64
+	rng := rand.New(rand.NewSource(1))
+	for len(background) < 20000 {
+		p := [2]float64{float64(rng.Intn(1000)), float64(rng.Intn(1000))}
+		if p[0] >= qmin[0] && p[0] <= qmax[0] &&
+			p[1] >= qmin[1] && p[1] <= qmax[1] {
+			continue
+		}
+		background = append(background, p)
+	}
+	points := make([][2]float64, 0, len(inside)+len(outside)+len(background))
+	points = append(points, inside...)
+	points = append(points, outside...)
+	points = append(points, background...)
+
+	search := func(tr *RTreeG[int]) (ids []int) {
+		tr.SearchClosed(qmin, qmax, func(_, _ [2]float64, id int) bool {
+			ids = append(ids, id)
+			return true
+		})
+		sort.Ints(ids)
+		return ids
+	}
+	want := make([]int, len(inside))
+	for i := range want {
+		want[i] = i
+	}
+
+	// The same dataset inserted in different orders produces different
+	// tree shapes; the result set must be identical every time.
+	for _, shuffleSeed := range []int64{0, 1, 2, 3, 4} {
+		order := rand.New(rand.NewSource(shuffleSeed)).Perm(len(points))
+		var tr RTreeG[int]
+		for _, i := range order {
+			tr.Insert(points[i], points[i], i)
+		}
+		ids := search(&tr)
+		if fmt.Sprintf("%v", ids) != fmt.Sprintf("%v", want) {
+			t.Fatalf("shuffle %d: expected %v, got %v",
+				shuffleSeed, want, ids)
+		}
+	}
+
+	// Early termination: stop after the first item.
+	var tr RTreeG[int]
+	for i, p := range points {
+		tr.Insert(p, p, i)
+	}
+	var count int
+	tr.SearchClosed(qmin, qmax, func(_, _ [2]float64, id int) bool {
+		count++
+		return false
+	})
+	if count != 1 {
+		t.Fatalf("expected early termination after 1 item, got %d", count)
+	}
+}
+
+func TestSearchClosedRects(t *testing.T) {
+	// Adjacent grid cells stored as rects. Querying one cell must not
+	// pull in the neighboring cell that shares the boundary edge, nor a
+	// rect that straddles the boundary.
+	var tr RTreeG[string]
+	tr.Insert([2]float64{0, 0}, [2]float64{10, 10}, "cell")
+	tr.Insert([2]float64{10, 0}, [2]float64{20, 10}, "east")
+	tr.Insert([2]float64{0, 10}, [2]float64{10, 20}, "north")
+	tr.Insert([2]float64{5, 5}, [2]float64{15, 15}, "straddle")
+	tr.Insert([2]float64{2, 2}, [2]float64{8, 8}, "inner")
+	tr.Insert([2]float64{8, 8}, [2]float64{10, 10}, "on-corner")
+	var got []string
+	tr.SearchClosed([2]float64{0, 0}, [2]float64{10, 10},
+		func(_, _ [2]float64, data string) bool {
+			got = append(got, data)
+			return true
+		})
+	sort.Strings(got)
+	exp := "[cell inner on-corner]"
+	if fmt.Sprintf("%v", got) != exp {
+		t.Fatalf("expected %s, got %v", exp, got)
+	}
+}
+
+func TestSearchClosedAgainstBruteForce(t *testing.T) {
+	// Integer grid points produce many exact boundary hits; compare
+	// SearchClosed against a closed-interval brute-force reference.
+	rng := rand.New(rand.NewSource(42))
+	var tr RTreeG[int]
+	type pt struct{ x, y float64 }
+	var pts []pt
+	for i := 0; i < 100000; i++ {
+		p := pt{float64(rng.Intn(1000)), float64(rng.Intn(1000))}
+		pts = append(pts, p)
+		tr.Insert([2]float64{p.x, p.y}, [2]float64{p.x, p.y}, i)
+	}
+	for q := 0; q < 200; q++ {
+		min := [2]float64{float64(rng.Intn(500)), float64(rng.Intn(500))}
+		max := [2]float64{
+			min[0] + float64(rng.Intn(500)),
+			min[1] + float64(rng.Intn(500)),
+		}
+		var want int
+		for _, p := range pts {
+			if p.x >= min[0] && p.x <= max[0] &&
+				p.y >= min[1] && p.y <= max[1] {
+				want++
+			}
+		}
+		var got int
+		tr.SearchClosed(min, max, func(_, _ [2]float64, _ int) bool {
+			got++
+			return true
+		})
+		if got != want {
+			t.Fatalf("query %v-%v: got %d, want %d", min, max, got, want)
+		}
+	}
+}
+
+func TestSearchClosedWrappers(t *testing.T) {
+	var tr RTree
+	tr.Insert([2]float64{10, 10}, [2]float64{10, 10}, "edge")
+	tr.Insert([2]float64{11, 11}, [2]float64{11, 11}, "outside")
+	var got []any
+	tr.SearchClosed([2]float64{0, 0}, [2]float64{10, 10},
+		func(_, _ [2]float64, data any) bool {
+			got = append(got, data)
+			return true
+		})
+	if fmt.Sprintf("%v", got) != "[edge]" {
+		t.Fatalf("expected [edge], got %v", got)
+	}
+	var trGN RTreeGN[int, string]
+	trGN.Insert([2]int{10, 10}, [2]int{10, 10}, "edge")
+	trGN.Insert([2]int{11, 11}, [2]int{11, 11}, "outside")
+	var gotGN []string
+	trGN.SearchClosed([2]int{0, 0}, [2]int{10, 10},
+		func(_, _ [2]int, data string) bool {
+			gotGN = append(gotGN, data)
+			return true
+		})
+	if fmt.Sprintf("%v", gotGN) != "[edge]" {
+		t.Fatalf("expected [edge], got %v", gotGN)
+	}
+}
