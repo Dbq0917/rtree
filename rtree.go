@@ -165,9 +165,9 @@ func (tr *RTreeGN[N, T]) Insert(min, max [2]N, data T) {
 	tr.count++
 }
 
-func (tr *RTreeGN[N, T]) splitNode(r rect[N], left *node[N, T],
+func (tr *RTreeGN[N, T]) splitNode(_ rect[N], left *node[N, T],
 ) (right *node[N, T]) {
-	return tr.splitNodeLargestAxisEdgeSnap(r, left)
+	return tr.splitNodeByDistribution(left)
 }
 
 // This operation should not be inlined because it's expensive and rarely
@@ -303,64 +303,39 @@ func (r *rect[N]) unionedArea(b *rect[N]) N {
 		(max(r.max[1], b.max[1]) - min(r.min[1], b.min[1]))
 }
 
-func (r rect[N]) largestAxis() (axis int) {
-	if r.max[1]-r.min[1] > r.max[0]-r.min[0] {
-		return 1
-	}
-	return 0
-}
-
-func (tr *RTreeGN[N, T]) splitNodeLargestAxisEdgeSnap(r rect[N],
+func (tr *RTreeGN[N, T]) splitNodeByDistribution(
 	left *node[N, T],
 ) (right *node[N, T]) {
-	axis := r.largestAxis()
-	right = tr.newNode(left.leaf())
-	for i := 0; i < int(left.count); i++ {
-		minDist := left.rects[i].min[axis] - r.min[axis]
-		maxDist := r.max[axis] - left.rects[i].max[axis]
-		if minDist < maxDist {
-			// stay left
-		} else {
-			// move to right
-			tr.moveRectAtIndexInto(left, i, right)
-			i--
-		}
+	axis := left.splitAxis()
+	left.sortByCenter(axis)
+	count := int(left.count)
+	split := count / 2
+	if split < 2 && count > 2 {
+		split = 2
 	}
-	// Make sure that both left and right nodes have at least
-	// two by moving items into underflowed nodes.
-	if left.count < 2 {
-		// reverse sort by min axis
-		right.sortByAxis(axis, true, false)
-		for left.count < 2 {
-			tr.moveRectAtIndexInto(right, int(right.count)-1, left)
-		}
-	} else if right.count < 2 {
-		// reverse sort by max axis
-		left.sortByAxis(axis, true, true)
-		for right.count < 2 {
-			tr.moveRectAtIndexInto(left, int(left.count)-1, right)
-		}
+	if split > count-2 && count > 2 {
+		split = count - 2
 	}
-	return right
-}
 
-func (tr *RTreeGN[N, T]) moveRectAtIndexInto(from *node[N, T], index int,
-	into *node[N, T],
-) {
-	var empty T
-	into.rects[into.count] = from.rects[index]
-	from.rects[index] = from.rects[from.count-1]
-	if from.leaf() {
-		into.items()[into.count] = from.items()[index]
-		from.items()[index] = from.items()[from.count-1]
-		from.items()[from.count-1] = empty
+	right = tr.newNode(left.leaf())
+	right.count = int16(count - split)
+	copy(right.rects[:right.count], left.rects[split:count])
+	if left.leaf() {
+		copy(right.items()[:right.count], left.items()[split:count])
+		var empty T
+		for i := split; i < count; i++ {
+			left.rects[i] = rect[N]{}
+			left.items()[i] = empty
+		}
 	} else {
-		into.children()[into.count] = from.children()[index]
-		from.children()[index] = from.children()[from.count-1]
-		from.children()[from.count-1] = nil
+		copy(right.children()[:right.count], left.children()[split:count])
+		for i := split; i < count; i++ {
+			left.rects[i] = rect[N]{}
+			left.children()[i] = nil
+		}
 	}
-	from.count--
-	into.count++
+	left.count = int16(split)
+	return right
 }
 
 func (n *node[N, T]) search(target *rect[N],
@@ -452,55 +427,65 @@ func (n *node[N, T]) swap(i, j int) {
 	}
 }
 
-func (n *node[N, T]) sortByAxis(axis int, rev, max bool) {
-	n.qsort(0, int(n.count), axis, rev, max)
+func (n *node[N, T]) centerAt(index, axis int) N {
+	r := &n.rects[index]
+	return r.min[axis]/2 + r.max[axis]/2
 }
 
-func (n *node[N, T]) qsort(s, e int, axis int, rev, max bool) {
-	nrects := e - s
-	if nrects < 2 {
-		return
+func (n *node[N, T]) splitAxis() int {
+	if n.count == 0 {
+		return 0
 	}
-	left, right := 0, nrects-1
-	pivot := nrects / 2 // rand and mod not worth it
-	n.swap(s+pivot, s+right)
-	rects := n.rects[s:e]
-	if !rev {
-		if !max {
-			for i := 0; i < len(rects); i++ {
-				if rects[i].min[axis] < rects[right].min[axis] {
-					n.swap(s+i, s+left)
-					left++
-				}
+	minCenter := [2]N{n.centerAt(0, 0), n.centerAt(0, 1)}
+	maxCenter := minCenter
+	for i := 1; i < int(n.count); i++ {
+		for axis := 0; axis < 2; axis++ {
+			center := n.centerAt(i, axis)
+			if center < minCenter[axis] {
+				minCenter[axis] = center
 			}
-		} else {
-			for i := 0; i < len(rects); i++ {
-				if rects[i].max[axis] < rects[right].max[axis] {
-					n.swap(s+i, s+left)
-					left++
-				}
-			}
-		}
-	} else {
-		if !max {
-			for i := 0; i < len(rects); i++ {
-				if rects[right].min[axis] < rects[i].min[axis] {
-					n.swap(s+i, s+left)
-					left++
-				}
-			}
-		} else {
-			for i := 0; i < len(rects); i++ {
-				if rects[right].max[axis] < rects[i].max[axis] {
-					n.swap(s+i, s+left)
-					left++
-				}
+			if center > maxCenter[axis] {
+				maxCenter[axis] = center
 			}
 		}
 	}
-	n.swap(s+left, s+right)
-	n.qsort(s, s+left, axis, rev, max)
-	n.qsort(s+left+1, e, axis, rev, max)
+	spread0 := float64(maxCenter[0]) - float64(minCenter[0])
+	spread1 := float64(maxCenter[1]) - float64(minCenter[1])
+	if spread1 > spread0 {
+		return 1
+	}
+	return 0
+}
+
+func (n *node[N, T]) sortByCenter(axis int) {
+	n.qsortCenter(0, int(n.count), axis)
+}
+
+func (n *node[N, T]) qsortCenter(start, end, axis int) {
+	for end-start > 1 {
+		pivot := n.centerAt(start+(end-start)/2, axis)
+		i, j := start, end-1
+		for i <= j {
+			for n.centerAt(i, axis) < pivot {
+				i++
+			}
+			for n.centerAt(j, axis) > pivot {
+				j--
+			}
+			if i <= j {
+				n.swap(i, j)
+				i++
+				j--
+			}
+		}
+		if j-start < end-i {
+			n.qsortCenter(start, j+1, axis)
+			start = i
+		} else {
+			n.qsortCenter(i, end, axis)
+			end = j + 1
+		}
+	}
 }
 
 // Delete data from tree
