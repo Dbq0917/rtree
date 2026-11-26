@@ -698,6 +698,12 @@ func (n *node[N, T]) maxist(dim int) (min, max [2]N, data T) {
 // The `iter` function will return all items from the smallest distance to the
 // largest distance.
 //
+// When dist is called with item == false, its result is the priority and
+// pruning bound for a node bounding rectangle. For best-first ordering and
+// early termination to be exact, that result must be a lower bound for all
+// items in the node. Use KNNExact when dist is an arbitrary function with no
+// such lower bound.
+//
 // BoxDist is included with this package for simple box-distance
 // calculations. For example, say you want to return the closest items to
 // Point(10 20):
