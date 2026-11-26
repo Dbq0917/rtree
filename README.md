@@ -88,11 +88,41 @@ tr.Search([2]float32{-112.1, 33.4}, [2]float32{-112.0, 33.5},
 tr.Delete([2]float32{-112.0078, 33.4373}, [2]float32{-112.0078, 33.4373}, "PHX")
 ```
 
+### Bulk loading
+
+For a large static batch, `Bulk` builds a packed Sort-Tile-Recursive tree
+instead of choosing a subtree and splitting for every insert:
+
+```go
+mins := [][2]float64{{10, 10}, {20, 20}}
+maxs := [][2]float64{{20, 20}, {30, 30}}
+data := []string{"a", "b"}
+
+var tr rtree.RTreeG[string]
+tr.Bulk(mins, maxs, data)
+```
+
+The three slices must have equal lengths and are reordered in place while
+keeping each coordinate/data triple together. Sorting does not allocate a
+second full-size rectangle or data slice. `BulkLoad` accepts an in-place
+`[]rtree.BulkItem[T]` when that representation is more convenient.
+
+Bulk-built nodes use the same copy-on-write representation as inserted nodes,
+so `Copy`, further `Insert`/`Delete`, and follow-up batches continue to work.
+Use `Stats`, `Height`, or `NodeCount` to inspect the packed shape. The
+`TestBulkLoadBenchFloat64` test compares sequential insertion and bulk loading
+for one million rectangles and reports height, node counts, and query timings.
 
 ## Algorithms
 
 This implementation is a variant of the original paper:  
 [R-TREES. A DYNAMIC INDEX STRUCTURE FOR SPATIAL SEARCHING](https://www.cs.princeton.edu/courses/archive/fall08/cos597B/papers/rtrees.pdf)
+
+### Bulk loading
+
+The bulk path spatially sorts the entries with Sort-Tile-Recursive ordering,
+packs leaves to `maxEntries`, and then packs child nodes bottom-up. A small
+final group is balanced with its neighbor to avoid a nearly empty node.
 
 ### Inserting
 

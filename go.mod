@@ -1,6 +1,6 @@
 module github.com/tidwall/rtree
 
-go 1.21
+go 1.23
 
 require (
 	github.com/tidwall/geoindex v1.7.0
