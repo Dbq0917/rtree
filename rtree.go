@@ -43,11 +43,12 @@ type numeric interface {
 }
 
 type RTreeGN[N numeric, T any] struct {
-	icow  uint64
-	count int
-	rect  rect[N]
-	root  *node[N, T]
-	qpool *sync.Pool
+	icow           uint64
+	count          int
+	rect           rect[N]
+	root           *node[N, T]
+	qpool          *sync.Pool
+	useLegacySplit bool
 }
 
 type rect[N numeric] struct {
@@ -167,7 +168,244 @@ func (tr *RTreeGN[N, T]) Insert(min, max [2]N, data T) {
 
 func (tr *RTreeGN[N, T]) splitNode(r rect[N], left *node[N, T],
 ) (right *node[N, T]) {
-	return tr.splitNodeLargestAxisEdgeSnap(r, left)
+	if tr.useLegacySplit {
+		return tr.splitNodeLargestAxisEdgeSnap(r, left)
+	}
+	return tr.splitNodeAdaptive(r, left)
+}
+
+// splitCandidate is a fully evaluated, but not yet applied, partition of an
+// overflowing node. Candidates are built from the on-stack rects and counters
+// only; no child data is moved while comparing them, so the evaluation stays
+// cheaper than the physical split. The winning candidate is applied once,
+// which keeps the copy-on-write allocation count identical to the legacy
+// single-axis split (exactly one new node per split).
+type splitCandidate[N numeric] struct {
+	axis   int
+	cut    N
+	left   rect[N]
+	right  rect[N]
+	lcount int16
+	rcount int16
+}
+
+// splitNodeAdaptive compares one count-balanced candidate per axis and
+// applies the best one. Each candidate divides the child centers at their
+// median so that both sides hold roughly the same number of entries. The
+// candidates are ranked by the overlap area of the two resulting bounding
+// rects first, then by the difference of their areas, and finally by how
+// evenly the entries are distributed. Ties keep the legacy preference for the
+// largest axis.
+func (tr *RTreeGN[N, T]) splitNodeAdaptive(r rect[N],
+	left *node[N, T],
+) (right *node[N, T]) {
+	largest := r.largestAxis()
+	cands := tr.evalSplits(left)
+	best := -1
+	for i := range cands {
+		cand := &cands[i]
+		if cand.lcount < 2 || cand.rcount < 2 {
+			continue
+		}
+		if best == -1 || cand.better(&cands[best], largest) {
+			best = i
+		}
+	}
+	if best == -1 {
+		// Every candidate underflowed one side; fall back to the legacy
+		// algorithm which guarantees the minimum entry count.
+		return tr.splitNodeLargestAxisEdgeSnap(r, left)
+	}
+	win := cands[best]
+	right = tr.newNode(left.leaf())
+	tr.applyMedianSplit(left, right, win.axis, win.cut)
+	// Make sure that both left and right nodes have at least two entries.
+	if left.count < 2 {
+		right.sortByAxis(win.axis, true, false)
+		for left.count < 2 {
+			tr.moveRectAtIndexInto(right, int(right.count)-1, left)
+		}
+	} else if right.count < 2 {
+		left.sortByAxis(win.axis, true, true)
+		for right.count < 2 {
+			tr.moveRectAtIndexInto(left, int(left.count)-1, right)
+		}
+	}
+	return right
+}
+
+func (c *splitCandidate[N]) better(o *splitCandidate[N], largest int) bool {
+	co := rectOverlapArea(&c.left, &c.right)
+	oo := rectOverlapArea(&o.left, &o.right)
+	if co != oo {
+		return co < oo
+	}
+	cd := rectAreaDiff(&c.left, &c.right)
+	od := rectAreaDiff(&o.left, &o.right)
+	if cd != od {
+		return cd < od
+	}
+	cb := c.rcount - c.lcount
+	if cb < 0 {
+		cb = -cb
+	}
+	ob := o.rcount - o.lcount
+	if ob < 0 {
+		ob = -ob
+	}
+	if cb != ob {
+		return cb < ob
+	}
+	if (c.axis == largest) != (o.axis == largest) {
+		return c.axis == largest
+	}
+	return false
+}
+
+// evalSplits builds both axis candidates in two passes over the children.
+// The first pass derives each axis' median center; the second pass expands
+// the two candidate bounding rects directly, with no per-child helper calls.
+// All scratch space lives on the stack, so the evaluation allocates nothing.
+func (tr *RTreeGN[N, T]) evalSplits(n *node[N, T]) [2]splitCandidate[N] {
+	count := int(n.count)
+	var cands [2]splitCandidate[N]
+	var cx, cy [maxEntries]N
+	for i := 0; i < count; i++ {
+		cr := &n.rects[i]
+		cx[i] = cr.min[0] + (cr.max[0]-cr.min[0])/2
+		cy[i] = cr.min[1] + (cr.max[1]-cr.min[1])/2
+	}
+	cands[0].axis, cands[1].axis = 0, 1
+	cands[0].cut = quickselect(cx[:count], count/2)
+	cands[1].cut = quickselect(cy[:count], count/2)
+	wantRight := int16(count / 2)
+	for i := 0; i < count; i++ {
+		cr := &n.rects[i]
+		for axis := 0; axis < 2; axis++ {
+			cand := &cands[axis]
+			var center N
+			if axis == 0 {
+				center = cx[i]
+			} else {
+				center = cy[i]
+			}
+			side := 0 // 0 -> left, 1 -> right
+			if center > cand.cut ||
+				(center == cand.cut && cand.rcount < wantRight) {
+				side = 1
+			}
+			if side == 0 {
+				if cand.lcount == 0 {
+					cand.left = *cr
+				} else {
+					cand.left.expand(cr)
+				}
+				cand.lcount++
+			} else {
+				if cand.rcount == 0 {
+					cand.right = *cr
+				} else {
+					cand.right.expand(cr)
+				}
+				cand.rcount++
+			}
+		}
+	}
+	return cands
+}
+
+// applyMedianSplit physically partitions the node at the precomputed median
+// center so that both sides end up with roughly the same entry count.
+func (tr *RTreeGN[N, T]) applyMedianSplit(left, right *node[N, T],
+	axis int, cut N,
+) {
+	total := int(left.count)
+	wantRight := total / 2
+	for i := 0; i < int(left.count); i++ {
+		cr := &left.rects[i]
+		center := cr.min[axis] + (cr.max[axis]-cr.min[axis])/2
+		if center > cut {
+			tr.moveRectAtIndexInto(left, i, right)
+			i--
+		}
+	}
+	for i := 0; i < int(left.count); i++ {
+		if int(right.count) >= wantRight {
+			break
+		}
+		cr := &left.rects[i]
+		center := cr.min[axis] + (cr.max[axis]-cr.min[axis])/2
+		if center == cut {
+			tr.moveRectAtIndexInto(left, i, right)
+			i--
+		}
+	}
+}
+
+// quickselect rearranges vals in place so that vals[k] holds the k-th
+// smallest value, which is then returned. A median-of-three pivot bounds the
+// work when child centers collapse onto nearly the same value in a dense
+// cluster. Buffers are fixed-size stack arrays of at most maxEntries
+// elements, so the algorithm stays allocation free and branch-predictable.
+func quickselect[N numeric](vals []N, k int) N {
+	lo, hi := 0, len(vals)-1
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		pivot := medianOfThree(vals[lo], vals[mid], vals[hi])
+		i, j := lo, hi
+		for i <= j {
+			for vals[i] < pivot {
+				i++
+			}
+			for vals[j] > pivot {
+				j--
+			}
+			if i <= j {
+				vals[i], vals[j] = vals[j], vals[i]
+				i++
+				j--
+			}
+		}
+		if k <= j {
+			hi = j
+		} else if k >= i {
+			lo = i
+		} else {
+			break
+		}
+	}
+	return vals[k]
+}
+
+func medianOfThree[N numeric](a, b, c N) N {
+	if a > b {
+		a, b = b, a
+	}
+	if b > c {
+		b = c
+	}
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func rectOverlapArea[N numeric](a, b *rect[N]) N {
+	w := min(a.max[0], b.max[0]) - max(a.min[0], b.min[0])
+	h := min(a.max[1], b.max[1]) - max(a.min[1], b.min[1])
+	if w <= 0 || h <= 0 {
+		var zero N
+		return zero
+	}
+	return w * h
+}
+
+func rectAreaDiff[N numeric](a, b *rect[N]) N {
+	aa, ab := a.area(), b.area()
+	if aa > ab {
+		return aa - ab
+	}
+	return ab - aa
 }
 
 // This operation should not be inlined because it's expensive and rarely

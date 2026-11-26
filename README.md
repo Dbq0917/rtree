@@ -115,22 +115,27 @@ Same as the original algorithm.
 
 ### Splitting
 
-This is a custom algorithm. It attempts to minimize intensive operations such as pre-sorting the children and comparing overlaps & area sizes. The desire is to do simple single axis distance calculations each child only once, with a target 50/50 chance that the child might be moved in-memory.
+The split is data aware. The legacy single-axis split always cuts the
+overflowing node's largest axis at its midpoint, which is cheap but produces
+two badly unbalanced halves when the data is clustered on one side of that
+axis. The dense half then overflows and splits again, so one branch keeps
+growing deeper and point queries pay for the long path.
 
-When a rect has reached it's max number of entries it's largest axis is calculated and the rect is split into two smaller rects, named `left` and `right`.
-Each child rects is then evaluated to determine which smaller rect it should be placed into.
-Two values, `min-dist` and `max-dist`, are calcuated for each child. 
+The current algorithm instead builds one count-balanced candidate per axis by
+partitioning the child centers at their median, and picks the candidate whose
+two resulting bounding rects have the least overlap, then the most similar
+areas, and finally the most even entry counts. Ties prefer the largest axis,
+preserving the old behavior on uniform data.
 
-- `min-dist` is the distance from the parent's minumum value of it's largest axis to the child's minumum value of the parent largest axis.
-- `max-dist` is the distance from the parent's maximum value of it's largest axis to the child's maximum value of the parent largest axis.
-
-When the `min-dist` is less than `max-dist` then the child is placed into the `left` rect. 
-When the `max-dist` is less than `min-dist` then the child is placed into the `right` rect. 
-When the `min-dist` is equal to `max-dist` then the child is placed into an `equal` bucket until all of the children are evaluated.
-Each `equal` rect is then one-by-one placed in either `left` or `right`, whichever has less children.
-
-Finally, sort all the rects in the parent node of the split rect by their
-minimum x value.
+To keep this cheap, the evaluation only touches on-stack scalars: child
+centers are collected in fixed-size buffers, each axis' median is found with
+an allocation-free median-of-three quickselect over at most `maxEntries`
+elements, and the candidate bounding rects are expanded in a second linear
+pass. No child data is moved while comparing; only the winning candidate is
+physically applied, so each split still allocates exactly one new node and the
+copy-on-write copy count is unchanged. When no candidate can keep both sides
+above the minimum entry count, the legacy largest-axis split is used as a
+fallback.
 
 ## License
 

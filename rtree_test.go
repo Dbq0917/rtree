@@ -954,3 +954,256 @@ func TestNearby(t *testing.T) {
 	})
 
 }
+
+// treeHeight returns the number of branch levels above the leaf nodes.
+func treeHeight[N numeric, T any](tr *RTreeGN[N, T]) int {
+	if tr.root == nil {
+		return 0
+	}
+	var height int
+	n := tr.root
+	for !n.leaf() {
+		height++
+		n = n.children()[0]
+	}
+	return height
+}
+
+// skewedRects builds points where a dense cluster sits next to a mostly empty
+// region. Most points are packed into a narrow band on the low end of the y
+// axis, which forces repeated one-sided splits under the legacy strategy.
+func skewedRects(n int) []rect[float64] {
+	rng := rand.New(rand.NewSource(42))
+	rects := make([]rect[float64], n)
+	for i := 0; i < n; i++ {
+		var x, y float64
+		if i%50 != 0 {
+			// Most of the data is packed into a tight cluster near the
+			// origin on both axes.
+			x = rng.Float64() * 0.001
+			y = rng.Float64() * 0.001
+		} else {
+			// A few far outliers on y stretch the longest axis orders of
+			// magnitude beyond the cluster. A midpoint split on that axis
+			// then dumps almost the whole cluster onto one side.
+			x = rng.Float64() * 0.001
+			y = 1e6 * rng.Float64()
+		}
+		rects[i] = rect[float64]{
+			min: [2]float64{x, y},
+			max: [2]float64{x, y},
+		}
+	}
+	return rects
+}
+
+func buildSkewedTree(legacy bool, n int) (*RTreeGN[float64, int], []rect[float64]) {
+	rects := skewedRects(n)
+	tr := new(RTreeGN[float64, int])
+	tr.useLegacySplit = legacy
+	for i, r := range rects {
+		tr.Insert(r.min, r.max, i)
+	}
+	return tr, rects
+}
+
+// countNodeVisits walks a single point query and counts every node and leaf
+// rectangle touched along the way, including internal branch levels.
+func countNodeVisits(n *node[float64, int], target *rect[float64]) int {
+	visits := 1
+	if n.leaf() {
+		for i := 0; i < int(n.count); i++ {
+			if n.rects[i].intersects(target) {
+				visits++
+			}
+		}
+		return visits
+	}
+	for i := 0; i < int(n.count); i++ {
+		if target.intersects(&n.rects[i]) {
+			visits += countNodeVisits(n.children()[i], target)
+		}
+	}
+	return visits
+}
+
+// pointSearchCost issues point queries inside the dense cluster and returns
+// the total number of nodes visited. Point queries touch only a few leaves, so
+// the branch-level work dominates and the metric tracks tree depth closely.
+func pointSearchCost(tr *RTreeGN[float64, int], queries int) (visits int) {
+	rng := rand.New(rand.NewSource(99))
+	for i := 0; i < queries; i++ {
+		cx := rng.Float64() * 0.001
+		cy := rng.Float64() * 0.001
+		target := rect[float64]{
+			min: [2]float64{cx, cy},
+			max: [2]float64{cx, cy},
+		}
+		visits += countNodeVisits(tr.root, &target)
+	}
+	return visits
+}
+
+// TestSkewedSplit verifies that data-aware splitting keeps the tree balanced
+// when rectangles pile up on one side of the data space.
+func TestSkewedSplit(t *testing.T) {
+	const n = 100_000
+	legacy, _ := buildSkewedTree(true, n)
+	adaptive, _ := buildSkewedTree(false, n)
+
+	if err := rSane(&RTreeG[int]{base: *adaptive}); err != nil {
+		t.Fatalf("adaptive tree not sane: %s", err)
+	}
+	if adaptive.Len() != n || legacy.Len() != n {
+		t.Fatalf("len mismatch: adaptive=%d legacy=%d want=%d",
+			adaptive.Len(), legacy.Len(), n)
+	}
+
+	legacyHeight := treeHeight(legacy)
+	adaptiveHeight := treeHeight[float64, int](adaptive)
+	t.Logf("skewed tree height: adaptive=%d legacy=%d",
+		adaptiveHeight, legacyHeight)
+	if adaptiveHeight > legacyHeight {
+		t.Fatalf("adaptive height %d exceeds legacy height %d",
+			adaptiveHeight, legacyHeight)
+	}
+	if adaptiveHeight >= legacyHeight {
+		t.Fatalf("adaptive split did not improve skew: both heights=%d",
+			adaptiveHeight)
+	}
+
+	const queries = 100_000
+	legacyVisits := pointSearchCost(legacy, queries)
+	adaptiveVisits := pointSearchCost(adaptive, queries)
+	t.Logf("point-query node visits over %d queries: adaptive=%d legacy=%d",
+		queries, adaptiveVisits, legacyVisits)
+	if adaptiveVisits > legacyVisits {
+		t.Fatalf("adaptive searches touch more rects: %d > %d",
+			adaptiveVisits, legacyVisits)
+	}
+}
+
+// TestSkewedSplitGenericNumeric exercises the generic integer path, which is
+// where unsigned subtraction and center calculations are easiest to get wrong.
+func TestSkewedSplitGenericNumeric(t *testing.T) {
+	const n = 2_000
+	rng := rand.New(rand.NewSource(7))
+	var tr RTreeGN[uint32, uint32]
+	for i := 0; i < n; i++ {
+		var x, y uint32
+		if i%10 != 0 {
+			x = uint32(rng.Intn(10))
+			y = uint32(rng.Intn(10))
+		} else {
+			x = uint32(rng.Intn(1000))
+			y = uint32(100 + rng.Intn(900))
+		}
+		tr.Insert([2]uint32{x, y}, [2]uint32{x, y}, uint32(i))
+	}
+	if tr.Len() != n {
+		t.Fatalf("len mismatch: %d != %d", tr.Len(), n)
+	}
+	var found int
+	tr.Scan(func(min, max [2]uint32, _ uint32) bool {
+		found++
+		return true
+	})
+	if found != n {
+		t.Fatalf("scan mismatch: %d != %d", found, n)
+	}
+}
+
+// TestQuickselect checks the median selection used to place balanced splits.
+// Heavy duplicate values are included on purpose, since dense clusters make
+// most child centers collapse onto the same value.
+func TestQuickselect(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	for trial := 0; trial < 500; trial++ {
+		m := 1 + rng.Intn(maxEntries)
+		vals := make([]int, m)
+		for i := range vals {
+			vals[i] = rng.Intn(5) - 2
+		}
+		sorted := append([]int{}, vals...)
+		sort.Ints(sorted)
+		for k := 0; k < m; k++ {
+			if got := quickselect(vals, k); got != sorted[k] {
+				t.Fatalf("trial %d m %d k %d: got %d want %d vals %v",
+					trial, m, k, got, sorted[k], vals)
+			}
+		}
+	}
+}
+
+// TestSplitAllocsNoRegression ensures candidate evaluation uses on-stack
+// buffers. Each split still performs a single node allocation, so heavy insert
+// workloads must not gain heap allocations versus the legacy strategy.
+func TestSplitAllocsNoRegression(t *testing.T) {
+	const n = 20_000
+	adaptiveAllocs := testing.AllocsPerRun(1, func() {
+		tr, _ := buildSkewedTree(false, n)
+		if tr.Len() != n {
+			t.Fatalf("len mismatch: %d", tr.Len())
+		}
+	})
+	legacyAllocs := testing.AllocsPerRun(1, func() {
+		tr, _ := buildSkewedTree(true, n)
+		if tr.Len() != n {
+			t.Fatalf("len mismatch: %d", tr.Len())
+		}
+	})
+	t.Logf("allocs over %d inserts: adaptive=%.0f legacy=%.0f",
+		n, adaptiveAllocs, legacyAllocs)
+	if adaptiveAllocs > legacyAllocs*1.1 {
+		t.Fatalf("adaptive split allocates too much: %.0f vs legacy %.0f",
+			adaptiveAllocs, legacyAllocs)
+	}
+}
+
+func BenchmarkSkewedInsert(b *testing.B) {
+	rects := skewedRects(50_000)
+	b.ReportAllocs()
+	for _, legacy := range []bool{false, true} {
+		name := "adaptive"
+		if legacy {
+			name = "legacy"
+		}
+		b.Run(name, func(b *testing.B) {
+			for k := 0; k < b.N; k++ {
+				var tr RTreeGN[float64, int]
+				tr.useLegacySplit = legacy
+				for i, r := range rects {
+					tr.Insert(r.min, r.max, i)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkSkewedPointSearch(b *testing.B) {
+	const n = 100_000
+	adaptive, _ := buildSkewedTree(false, n)
+	legacy, _ := buildSkewedTree(true, n)
+	rng := rand.New(rand.NewSource(99))
+	const q = 4096
+	queries := make([][2]float64, q)
+	for i := range queries {
+		queries[i] = [2]float64{rng.Float64() * 0.001, rng.Float64() * 0.001}
+	}
+	b.Run("adaptive", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			p := queries[i%q]
+			cx, cy := p[0], p[1]
+			adaptive.Search([2]float64{cx, cy}, [2]float64{cx, cy},
+				func(min, max [2]float64, _ int) bool { return true })
+		}
+	})
+	b.Run("legacy", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			p := queries[i%q]
+			cx, cy := p[0], p[1]
+			legacy.Search([2]float64{cx, cy}, [2]float64{cx, cy},
+				func(min, max [2]float64, _ int) bool { return true })
+		}
+	})
+}
